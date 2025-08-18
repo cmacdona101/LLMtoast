@@ -77,34 +77,68 @@ SMTO_ABORTIFHUNG = 0x0002
 VK_Z, VK_SPACE, VK_OEM_3 = 0x5A, 0x20, 0xC0
 VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN, VK_CONTROL, VK_C = 0x10, 0x12, 0x5B, 0x5C, 0x11, 0x43
 
-# SendInput structs
-PUL = ctypes.POINTER(ctypes.c_ulong)
+# --------------------------- Pointer-sized types (fix for Py 3.13) ---------------------------
+# ctypes.wintypes.ULONG_PTR is not present in some Python builds. Define a compatible alias.
+try:
+    ULONG_PTR = wintypes.ULONG_PTR  # may raise AttributeError
+except AttributeError:
+    ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+
+# --------------------------- SendInput (correct structs) ---------------------------
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG),
+                ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ULONG_PTR)]
+
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [("wVk", wintypes.WORD),
                 ("wScan", wintypes.WORD),
                 ("dwFlags", wintypes.DWORD),
                 ("time", wintypes.DWORD),
-                ("dwExtraInfo", PUL)]
+                ("dwExtraInfo", ULONG_PTR)]
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", wintypes.DWORD),
+                ("wParamL", wintypes.WORD),
+                ("wParamH", wintypes.WORD)]
+
+class INPUT_UNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT),
+                ("ki", KEYBDINPUT),
+                ("hi", HARDWAREINPUT)]
+
 class INPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD),
-                ("ki", KEYBDINPUT)]
+                ("union", INPUT_UNION)]
+
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_SCANCODE = 0x0008
+KEYEVENTF_SCANCODE = 0x0008  # not used here, but defined for completeness
 
 def _sendinput_key(vk, down=True):
     flags = 0 if down else KEYEVENTF_KEYUP
-    inp = INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=None))
-    if user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp)) != 1:
+    inp = INPUT()
+    inp.type = INPUT_KEYBOARD
+    inp.union.ki.wVk = vk
+    inp.union.ki.wScan = 0
+    inp.union.ki.dwFlags = flags
+    inp.union.ki.time = 0
+    inp.union.ki.dwExtraInfo = 0
+    n = user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+    if n != 1:
         log.debug("SendInput failed for vk=0x%X down=%s err=%d", vk, down, ctypes.get_last_error())
 
 def _is_key_down(vk):
     return (user32.GetAsyncKeyState(vk) & 0x8000) != 0
 
-# Focus info helpers
+# --------------------------- Focus info helpers ---------------------------
 class RECT(ctypes.Structure):
     _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
                 ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
 class GUITHREADINFO(ctypes.Structure):
     _fields_ = [("cbSize", wintypes.DWORD),
                 ("flags", wintypes.DWORD),
@@ -211,7 +245,6 @@ def ask_llm(prompt: str) -> str:
 
 # --------------------------- Popup UI ---------------------------
 def make_tray_icon(size=32):
-    from PIL import Image, ImageDraw
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.rounded_rectangle((2, 4, size-3, size-7), radius=7, fill=(0, 122, 204, 255))
@@ -219,8 +252,6 @@ def make_tray_icon(size=32):
     d.text((7, 9), "LL", fill=(255, 255, 255, 255))
     return img
 
-import tkinter as tk
-from tkinter import ttk
 class PopupManager:
     def __init__(self, root):
         self.root = root
@@ -256,13 +287,18 @@ class PopupManager:
                 if w in self.popups: self.popups.remove(w)
             w.bind("<Destroy>", on_destroy)
             # auto-close w/ hover pause
-            state={"in":False}
+            state = {"inside": False}
             def arm():
-                if not state["in"]:
+                if not state["inside"]:
                     try: w.destroy(); log.debug("Popup auto-closed")
                     except Exception: pass
-            w.bind("<Enter>", lambda e: state.update(in=True))
-            w.bind("<Leave>", lambda e: (state.update(in=False), w.after(POPUP_LIFETIME_MS, arm)))
+            def _on_enter(_event=None):
+                state["inside"] = True
+            def _on_leave(_event=None):
+                state["inside"] = False
+                w.after(POPUP_LIFETIME_MS, arm)
+            w.bind("<Enter>", _on_enter)
+            w.bind("<Leave>", _on_leave)
             w.after(POPUP_LIFETIME_MS, arm)
             # fade-in
             def fade(a=0.0):
@@ -274,14 +310,16 @@ class PopupManager:
         except Exception: log_exc("PopupManager.show failed")
 
 # --------------------------- Selection (Clipboard path hardened) ---------------------------
-def _attempt_copy_via_wmcopy_and_sendinput(max_wait_ms=1800):
-    """Try WM_COPY first; if no clipboard change, send Ctrl+C via SendInput with modifiers managed."""
-    # Snapshot focus
+def _focused_hwnd_and_class_for_log():
     hwnd_fg, hwnd_focus, cls = _focused_hwnd_and_class()
     log.debug("Focus: hwnd_fg=0x%X hwnd_focus=0x%X class='%s'",
               int(hwnd_fg or 0), int(hwnd_focus or 0), cls)
+    return hwnd_fg, hwnd_focus, cls
 
-    # Snapshot key states
+def _attempt_copy_via_wmcopy_and_sendinput(max_wait_ms=2000):
+    """Try WM_COPY first; if no clipboard change, send Ctrl+C via SendInput with modifiers managed."""
+    # Snapshot focus + keys
+    _focused_hwnd_and_class_for_log()
     ks = {
         "SHIFT": _is_key_down(VK_SHIFT),
         "ALT":   _is_key_down(VK_MENU),
@@ -295,6 +333,7 @@ def _attempt_copy_via_wmcopy_and_sendinput(max_wait_ms=1800):
     original = get_clipboard_text()
 
     # 1) WM_COPY directly to focused control (if any)
+    _, hwnd_focus, _ = _focused_hwnd_and_class()
     changed = False
     if hwnd_focus:
         try:
@@ -304,8 +343,8 @@ def _attempt_copy_via_wmcopy_and_sendinput(max_wait_ms=1800):
         except Exception:
             log_exc("WM_COPY send failed")
 
-        # poll for change quickly
-        deadline = time.time() + (max_wait_ms / 1000.0) * 0.4  # ~40% of budget
+        # poll for change quickly (~40% of budget)
+        deadline = time.time() + (max_wait_ms / 1000.0) * 0.4
         while time.time() < deadline:
             if GetClipboardSequenceNumber() != seq_before:
                 changed = True; break
@@ -313,7 +352,6 @@ def _attempt_copy_via_wmcopy_and_sendinput(max_wait_ms=1800):
 
     # 2) If still no change, use SendInput Ctrl+C, making sure Shift/Alt/Win are UP temporarily
     if not changed:
-        # Temporarily lift modifiers that could interfere
         lifted = []
         for vk, name in [(VK_SHIFT, "SHIFT"), (VK_MENU, "ALT"), (VK_LWIN, "LWIN"), (VK_RWIN, "RWIN")]:
             if _is_key_down(vk):
@@ -322,7 +360,6 @@ def _attempt_copy_via_wmcopy_and_sendinput(max_wait_ms=1800):
                 time.sleep(0.01)
                 lifted.append(vk)
 
-        # Ensure Ctrl is not stuck down/up weirdly; we'll drive it explicitly
         ctrl_was_down = _is_key_down(VK_CONTROL)
         if not ctrl_was_down:
             _sendinput_key(VK_CONTROL, down=True); time.sleep(0.01)
@@ -330,15 +367,13 @@ def _attempt_copy_via_wmcopy_and_sendinput(max_wait_ms=1800):
         _sendinput_key(VK_C, down=False); time.sleep(0.005)
         _sendinput_key(VK_CONTROL, down=False); time.sleep(0.01)
         if ctrl_was_down:
-            # Restore Ctrl if user had it down (rare here, but safe)
             _sendinput_key(VK_CONTROL, down=True)
 
-        # Restore previously lifted modifiers
         for vk in lifted:
             _sendinput_key(vk, down=True); time.sleep(0.005)
 
-        # Poll for change (rest of budget)
-        deadline = time.time() + (max_wait_ms / 1000.0) * 0.6  # remaining ~60%
+        # Poll for change (remaining ~60% budget)
+        deadline = time.time() + (max_wait_ms / 1000.0) * 0.6
         while time.time() < deadline:
             if GetClipboardSequenceNumber() != seq_before:
                 changed = True; break
