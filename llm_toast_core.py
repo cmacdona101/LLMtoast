@@ -10,6 +10,7 @@ import os, sys, time, ctypes, traceback, logging, platform
 from ctypes import wintypes
 
 import llm_toast_io as io  # <-- NEW split
+import llm_toast_llm as llm
 
 # --------------------------- Logging ---------------------------
 def _setup_logger():
@@ -121,13 +122,8 @@ def set_clipboard_text(text: str):
 
 # --------------------------- LLM stub ---------------------------
 def ask_llm(prompt: str) -> str:
-    log.debug("ask_llm(%d chars)", len(prompt))
-    p = prompt.strip()
-    max_chars = 2000
-    if len(p) > max_chars: p = p[:max_chars] + "…"
-    resp = f"LLM (stub) received {len(prompt)} chars.\n\n{p}"
-    log.debug("ask_llm -> %d chars", len(resp))
-    return resp
+    # Delegate to the real LLM client (falls back to helpful message if no key)
+    return llm.explain_selection(prompt)
 
 # --------------------------- Selection via clipboard (robust) ---------------------------
 def attempt_copy_via_wmcopy_and_sendinput(max_wait_ms=2000):
