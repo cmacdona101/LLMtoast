@@ -359,7 +359,7 @@ class App:
     def _on_hotkey(self):
         log.debug("_on_hotkey (UI) entered")
         try:
-            sel, original = core.attempt_copy_via_wmcopy_and_sendinput(max_wait_ms=2000)
+            sel, original = core.attempt_copy_via_wmcopy_and_sendinput(max_wait_ms=500)
             if not sel:
                 log.debug("No selection captured; no popup")
                 return

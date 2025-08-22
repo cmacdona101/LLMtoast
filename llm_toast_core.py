@@ -94,6 +94,25 @@ def focused_info_for_log():
               int(hwnd_fg or 0), int(hwnd_focus or 0), cls)
     return hwnd_fg, hwnd_focus, cls
 
+
+# ---- tiny safe wrappers for SendInput + sleep ----
+def _sleep_ms(ms: int):
+    try:
+        time.sleep(ms / 1000.0)
+    except Exception:
+        pass
+
+def _safe_sendkey(vk: int, down: bool):
+    try:
+        io.sendinput_key(vk, down=down)
+    except Exception:
+        log_exc(f"sendinput_key(vk=0x{vk:X}, down={down}) threw")
+
+def _tap_key(vk: int, down_up_delay_ms: int = 5):
+    _safe_sendkey(vk, True)
+    _sleep_ms(down_up_delay_ms)
+    _safe_sendkey(vk, False)
+
 # --------------------------- Public: Hotkeys (wrappers to io) ---------------------------
 # Hotkeys to try (UI text shows whichever succeeds)
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN = 0x1, 0x2, 0x4, 0x8
@@ -164,18 +183,19 @@ def attempt_copy_via_wmcopy_and_sendinput(max_wait_ms=2000):
         for vk, name in [(VK_SHIFT, "SHIFT"), (VK_MENU, "ALT"), (VK_LWIN, "LWIN"), (VK_RWIN, "RWIN")]:
             if io.is_key_down(vk):
                 log.debug("Temporarily releasing %s", name)
-                io.sendinput_key(vk, down=False)
-                time.sleep(0.01)
+                _safe_sendkey(vk, False)
+                _sleep_ms(10)
                 lifted.append(vk)
 
         ctrl_was_down = io.is_key_down(VK_CONTROL)
         if not ctrl_was_down:
-            io.sendinput_key(VK_CONTROL, down=True); time.sleep(0.01)
-        io.sendinput_key(VK_C, down=True); time.sleep(0.005)
-        io.sendinput_key(VK_C, down=False); time.sleep(0.005)
-        io.sendinput_key(VK_CONTROL, down=False); time.sleep(0.01)
+            _safe_sendkey(VK_CONTROL, True)
+            _sleep_ms(10)
+        _tap_key(VK_C, down_up_delay_ms=5)
+        _safe_sendkey(VK_CONTROL, False)
+        _sleep_ms(10)
         if ctrl_was_down:
-            io.sendinput_key(VK_CONTROL, down=True)
+            _safe_sendkey(VK_CONTROL, True)
 
         for vk in lifted:
             io.sendinput_key(vk, down=True); time.sleep(0.005)
@@ -185,7 +205,7 @@ def attempt_copy_via_wmcopy_and_sendinput(max_wait_ms=2000):
         while time.time() < deadline:
             if GetClipboardSequenceNumber() != seq_before:
                 changed = True; break
-            time.sleep(0.02)
+            _sleep_ms(20)
 
     if not changed:
         log.info("Clipboard did not change after WM_COPY/SendInput Ctrl+C")
