@@ -11,6 +11,8 @@ import pystray
 from pystray import MenuItem as Item, Menu as TrayMenu
 from PIL import Image, ImageDraw
 import tkinter as tk
+from tkinter import ttk
+from tkinter import font as tkfont
 
 import llm_toast_core as core
 import llm_toast_llm as llm
@@ -196,22 +198,87 @@ class ChatWindow:
         w.resizable(True, False)
         w.attributes("-topmost", True)
 
-        bg = "#efefef"; border = "#cfcfcf"
-        frame = tk.Frame(w, bg=bg, padx=10, pady=10, highlightthickness=1, highlightbackground=border, bd=0)
+        # --- Dark theme colors ---
+        bg_main   = "#0b0b0b"  # window background (almost black)
+        panel_bg  = "#1a1a1a"  # transcript panel background (lighter gray)
+        entry_bg  = "#252525"  # input background
+        border    = "#2a2a2a"
+        w.configure(bg=bg_main)
+
+        frame = tk.Frame(
+            w, bg=bg_main, padx=10, pady=10,
+            highlightthickness=1, highlightbackground=border, bd=0
+        )
         frame.pack(fill="both", expand=True)
+        
+        
+        # Legible UI fonts (fallback to Tk default if Segoe UI is unavailable)
+        try:
+            ui_font = tkfont.Font(family="Segoe UI", size=11)
+        except Exception:
+            ui_font = tkfont.nametofont("TkDefaultFont")
+            try:
+                ui_font.configure(size=11)
+            except Exception:
+                pass
 
         # Transcript area (Text + vertical Scrollbar) grouped in its own frame
-        trans = tk.Frame(frame, bg=bg)
+        trans = tk.Frame(frame, bg=bg_main)
         trans.pack(fill="both", expand=True)
-        self.out = tk.Text(trans, height=16, wrap="word", state="disabled")
+        self.out = tk.Text(
+            trans, height=16, wrap="word", state="disabled",
+            bg=panel_bg, fg="#ffffff",  # default fg = white (assistant)
+            font=ui_font,
+            insertbackground="#ffffff", relief="flat", bd=0,
+            selectbackground="#3a3a3a", highlightthickness=0
+        )
         self.out.pack(side="left", fill="both", expand=True)
-        scroll = tk.Scrollbar(trans, orient="vertical", command=self.out.yview)
+
+
+        # Dark-themed ttk Scrollbar
+        scroll_trough = "#0f0f0f"
+        scroll_bg     = "#2d2d2d"
+        scroll_arrow  = "#bbbbbb"
+        scroll_border = "#2a2a2a"
+        try:
+            style = ttk.Style()
+            # Use a theme that honors color options
+            try: style.theme_use("clam")
+            except Exception: pass
+            style.configure(
+                "Dark.Vertical.TScrollbar",
+                troughcolor=scroll_trough,
+                background=scroll_bg,
+                bordercolor=scroll_border,
+                arrowcolor=scroll_arrow
+            )
+        except Exception:
+            style = None
+        scroll = ttk.Scrollbar(
+            trans, orient="vertical", command=self.out.yview,
+            style="Dark.Vertical.TScrollbar" if style else None
+        )
         scroll.pack(side="right", fill="y")
         self.out.config(yscrollcommand=scroll.set)
         
-        
-        
-        self.inp = tk.Entry(frame)
+
+        # Color tags for speakers
+        # Color tags for speakers (ensure 'user' is visibly yellow)
+        self.out.tag_configure("user", foreground="#FFD54A", font=ui_font)       # yellow
+        self.out.tag_configure("assistant", foreground="#FFFFFF", font=ui_font)  # white
+        # Raise user tag priority to ensure it wins over defaults
+        try:
+            self.out.tag_raise("user")
+        except Exception:
+           pass
+
+        self.inp = tk.Entry(
+            frame, bg=entry_bg, fg="#ffffff",
+            insertbackground="#ffffff", relief="flat", bd=0,
+            highlightthickness=1, highlightbackground=border, highlightcolor="#3a3a3a"
+        )
+
+
         self.inp.pack(fill="x", pady=(8,0))
 
         self.inp.bind("<Return>", self._on_enter)
@@ -269,7 +336,16 @@ class ChatWindow:
     def _append(self, who: str, text: str):
         if not self.out: return
         self.out.config(state="normal")
+        
+        start = self.out.index("end-1c")
         self.out.insert("end", f"{who}: {text}\n")
+        end = self.out.index("end-1c")
+        tag = "user" if who.strip().lower().startswith("you") else "assistant"
+        
+        try:
+            self.out.tag_add(tag, start, end)
+        except Exception:
+            pass
         self.out.see("end")
         self.out.config(state="disabled")
 
