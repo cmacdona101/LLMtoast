@@ -170,6 +170,8 @@ class ChatWindow:
         self.out = None   # transcript (tk.Text)
         self.inp = None   # entry (tk.Entry)
         self.sending = False
+        # Session id for GPT-5 Responses API; persists until window is closed
+        self.prev_response_id = None
 
     def is_visible(self):
         return bool(self.win and self.win.winfo_exists() and self.win.state() != "withdrawn")
@@ -177,7 +179,17 @@ class ChatWindow:
     def show(self):
         import tkinter as tk
         if self.is_visible():
-            self.win.deiconify(); self.win.lift(); self.inp.focus_set(); return
+            # Ensure the window and entry truly gain focus when re-opening
+            self.win.deiconify()
+            self.win.lift()
+            try: self.win.focus_force()
+            except Exception: pass
+            if self.inp:
+                self.inp.focus_set()
+                self.inp.icursor("end")
+            return
+        
+        
         w = tk.Toplevel(self.root)
         self.win = w
         w.title("ClipLLM Chat")
@@ -188,8 +200,17 @@ class ChatWindow:
         frame = tk.Frame(w, bg=bg, padx=10, pady=10, highlightthickness=1, highlightbackground=border, bd=0)
         frame.pack(fill="both", expand=True)
 
-        self.out = tk.Text(frame, height=12, wrap="word", state="disabled")
-        self.out.pack(fill="both", expand=True)
+        # Transcript area (Text + vertical Scrollbar) grouped in its own frame
+        trans = tk.Frame(frame, bg=bg)
+        trans.pack(fill="both", expand=True)
+        self.out = tk.Text(trans, height=16, wrap="word", state="disabled")
+        self.out.pack(side="left", fill="both", expand=True)
+        scroll = tk.Scrollbar(trans, orient="vertical", command=self.out.yview)
+        scroll.pack(side="right", fill="y")
+        self.out.config(yscrollcommand=scroll.set)
+        
+        
+        
         self.inp = tk.Entry(frame)
         self.inp.pack(fill="x", pady=(8,0))
 
@@ -199,15 +220,52 @@ class ChatWindow:
         # position at center of active monitor
         w.update_idletasks()
         width = max(520, w.winfo_reqwidth())
-        height = max(220, w.winfo_reqheight())
+        base_h = max(220, w.winfo_reqheight())
+        height = int(base_h * 1.33)  # increase vertical size by ~33%
         x, y = self.center_cb(width, height)
         w.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
-        self.inp.focus_set()
+
+        # Aggressively claim focus on the window and input (handles focus races)
+        def _ensure_focus():
+            if not self.win or not self.win.winfo_exists():
+                return
+            try:
+                self.win.lift()
+                self.win.focus_force()
+            except Exception:
+                pass
+            if self.inp and self.inp.winfo_exists():
+                try:
+                    self.inp.focus_set()
+                    self.inp.icursor("end")
+                except Exception:
+                    pass
+        # Schedule a few times to win against tray/hotkey focus timing
+        self.root.after(0, _ensure_focus)
+        self.root.after(25, _ensure_focus)
+        self.root.after(100, _ensure_focus)
+        self.root.after(200, _ensure_focus)
+        
+        
+        
+        
+        # Clear session only when the window is actually closed via the titlebar
+        def _on_close():
+            self.prev_response_id = None
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        w.protocol("WM_DELETE_WINDOW", _on_close)
 
     def hide(self):
         if self.win and self.win.winfo_exists():
             self.win.withdraw()
+        # Do NOT clear prev_response_id here; keep session across hides
 
+    
+    
+    
     def _append(self, who: str, text: str):
         if not self.out: return
         self.out.config(state="normal")
@@ -228,7 +286,9 @@ class ChatWindow:
 
     def _send_worker(self, msg: str):
         try:
-            reply = llm.chat(msg)
+            reply, rid = llm.chat(msg, prev_response_id=self.prev_response_id)
+            if rid:
+                self.prev_response_id = rid
         except Exception as e:
             reply = f"Error: {e}"
             
@@ -243,7 +303,7 @@ class ChatWindow:
             self.sending = False
         self.root.after(0, back)
             
-            
+          
             
 
             
