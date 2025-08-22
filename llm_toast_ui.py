@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw
 import tkinter as tk
 
 import llm_toast_core as core
+import llm_toast_llm as llm
 
 import llm_toast_settings as settings
 
@@ -159,6 +160,94 @@ class PopupManager:
 
         except Exception:
             core.log_exc("PopupManager.show failed")
+            
+            
+class ChatWindow:
+    def __init__(self, root, center_cb):
+        self.root = root
+        self.center_cb = center_cb
+        self.win = None
+        self.out = None   # transcript (tk.Text)
+        self.inp = None   # entry (tk.Entry)
+        self.sending = False
+
+    def is_visible(self):
+        return bool(self.win and self.win.winfo_exists() and self.win.state() != "withdrawn")
+
+    def show(self):
+        import tkinter as tk
+        if self.is_visible():
+            self.win.deiconify(); self.win.lift(); self.inp.focus_set(); return
+        w = tk.Toplevel(self.root)
+        self.win = w
+        w.title("ClipLLM Chat")
+        w.resizable(True, False)
+        w.attributes("-topmost", True)
+
+        bg = "#efefef"; border = "#cfcfcf"
+        frame = tk.Frame(w, bg=bg, padx=10, pady=10, highlightthickness=1, highlightbackground=border, bd=0)
+        frame.pack(fill="both", expand=True)
+
+        self.out = tk.Text(frame, height=12, wrap="word", state="disabled")
+        self.out.pack(fill="both", expand=True)
+        self.inp = tk.Entry(frame)
+        self.inp.pack(fill="x", pady=(8,0))
+
+        self.inp.bind("<Return>", self._on_enter)
+        self.inp.bind("<Escape>", lambda e: self.hide())
+
+        # position at center of active monitor
+        w.update_idletasks()
+        width = max(520, w.winfo_reqwidth())
+        height = max(220, w.winfo_reqheight())
+        x, y = self.center_cb(width, height)
+        w.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
+        self.inp.focus_set()
+
+    def hide(self):
+        if self.win and self.win.winfo_exists():
+            self.win.withdraw()
+
+    def _append(self, who: str, text: str):
+        if not self.out: return
+        self.out.config(state="normal")
+        self.out.insert("end", f"{who}: {text}\n")
+        self.out.see("end")
+        self.out.config(state="disabled")
+
+    def _on_enter(self, _evt=None):
+        if self.sending or not self.inp: return "break"
+        msg = self.inp.get().strip()
+        if not msg: return "break"
+        self.inp.delete(0, "end")
+        self._append("You", msg)
+        self.sending = True
+        self.inp.config(state="disabled")
+        threading.Thread(target=self._send_worker, args=(msg,), daemon=True).start()
+        return "break"
+
+    def _send_worker(self, msg: str):
+        try:
+            reply = llm.chat(msg)
+        except Exception as e:
+            reply = f"Error: {e}"
+            
+        #print(reply)
+
+        def back():
+            if not self.win or not self.win.winfo_exists():
+                return
+            self._append("Assistant", reply)
+            self.inp.config(state="normal")
+            self.inp.focus_set()
+            self.sending = False
+        self.root.after(0, back)
+            
+            
+            
+
+            
+            
 
 # --------------------------- App (UI) ---------------------------
 class App:
@@ -180,6 +269,11 @@ class App:
         self.hotkey_id = None
         self.hotkey_label = None
         self.hk_thread = threading.Thread(target=self._hotkey_loop, daemon=True, name="HotkeyThread")
+        
+        # Chat hotkey (distinct id; choose a combo unlikely to conflict)
+        self.chat_hotkey_id = 1002
+        self.chat_hotkey_label = "Ctrl+Alt+M"
+        self.chat = ChatWindow(self.root, center_cb=self._center_on_active_monitor)
 
         # Tray
         self.icon = pystray.Icon(
@@ -190,6 +284,7 @@ class App:
             menu=TrayMenu(
                 Item(lambda i: f"Hotkey: {self.hotkey_label or '…'}", None, enabled=False),
                 pystray.Menu.SEPARATOR,
+                Item("Open Chat", self._toggle_chat),
                 Item("Options...", self._open_options),
                 Item("Enable Hotkey", self._toggle_hotkey, checked=lambda i: self.hotkey_enabled),
                 Item("Quit", self._quit)
@@ -328,6 +423,18 @@ class App:
         except SystemExit as e:
             self.hotkey_id, self.hotkey_label = None, "(none)"
             log.error("Hotkey registration failed: %s", e)
+            
+            
+        # Also register the chat hotkey (Ctrl+Alt+M)
+        MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x1, 0x2, 0x4000
+        VK_M = 0x4D
+        if user32.RegisterHotKey(None, self.chat_hotkey_id, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_M):
+            log.info("[hotkey] Registered (chat): %s (id=%d)", self.chat_hotkey_label, self.chat_hotkey_id)
+        else:
+            err = ctypes.get_last_error()
+            log.warning("[hotkey] Could not register chat hotkey %s (err=%d)", self.chat_hotkey_label, err)
+            ctypes.set_last_error(0)
+            
         try:
             self.icon.update_menu()
         except Exception:
@@ -349,6 +456,12 @@ class App:
                 if msg.message == WM_HOTKEY and self.hotkey_id and msg.wParam == self.hotkey_id and self.hotkey_enabled:
                     log.info("[hotkey] Triggered")
                     self.tasks.put(self._on_hotkey)
+                    
+                    
+                elif msg.message == WM_HOTKEY and msg.wParam == self.chat_hotkey_id and self.hotkey_enabled:
+                    log.info("[hotkey] Chat triggered")
+                    self.tasks.put(self._toggle_chat)
+                    
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))
             except Exception:
@@ -369,6 +482,12 @@ class App:
                 core.set_clipboard_text(original)
         except Exception:
             core.log_exc("_on_hotkey failed in UI")
+            
+    def _toggle_chat(self, icon=None, item=None):
+        if self.chat.is_visible():
+            self.chat.hide()
+        else:
+            self.chat.show()
 
     # Tk task pump
     def _drain_tasks(self):

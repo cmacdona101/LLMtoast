@@ -1,0 +1,7 @@
+
+
+for debugging, may have to use this to kill prior processes:
+taskkill /IM ClipLLMTray.exe /F 2>nul
+ 
+ 
+ 
