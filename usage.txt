@@ -4,4 +4,12 @@ for debugging, may have to use this to kill prior processes:
 taskkill /IM ClipLLMTray.exe /F 2>nul
  
  
+ compiling to EXE:
  
+mkdir C:\_pyi\out 2>nul
+mkdir C:\_pyi\build 2>nul
+
+pyinstaller llm_toast_ui.py --name ClipLLMTray --onefile --windowed --noupx --clean --noconfirm ^
+  --distpath C:\_pyi\out --workpath C:\_pyi\build ^
+  --hidden-import win32timezone --collect-submodules keyring.backends --collect-data keyring ^
+  --log-level DEBUG
