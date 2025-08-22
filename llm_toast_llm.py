@@ -3,7 +3,7 @@
 Thin, resilient LLM client for ClipLLM.
 
 - Reads API key from llm_toast_settings (Credential Manager/DPAPI).
-- Optional config in %APPDATA%\\ClipLLM\\settings.json (api_base, model, timeout_s).
+- Optional config in %APPDATA%\ClipLLM\settings.json (api_base, model, timeout_s).
 - Public helpers:
     * explain_selection(text) -> str       # single-sentence explain (system prompt)
     * chat(user_text, system_prompt=...)   # one-off chat turn
@@ -35,13 +35,13 @@ DEFAULT_CHAT_MODEL = "gpt-5-2025-08-07"        # used for chat window
 # Back-compat alias for historical typo (if any old code references DEFAULT_CHAT_MODE)
 DEFAULT_CHAT_MODE = DEFAULT_CHAT_MODEL
 
-DEFAULT_API_BASE = "https://api.openai.com/v1"  # override via settings/env if needed
-DEFAULT_TIMEOUT_S = 35
+DEFAULT_API_BASE = "https://api.openai.com/v1"  # override via ettings/env if needed
+DEFAULT_TIMEOUT_S = 360
 DEFAULT_TEMPERATURE = 1  # <-- per request, keep temperature at 1
 
 # Separate token budgets (can be adjusted later or wired to settings if desired)
-EXPLAIN_MAX_TOKENS = 400
-CHAT_MAX_TOKENS = 1024
+EXPLAIN_MAX_TOKENS = 4048
+CHAT_MAX_TOKENS = 10000
 
 SYSTEM_PROMPT = (
     "You will receive a text selection copied from the user's screen. "
@@ -50,7 +50,7 @@ SYSTEM_PROMPT = (
 )
 
 DEFAULT_CHAT_SYSTEM_PROMPT = (
-    "You are a concise, helpful assistant. Answer briefly and clearly."
+    "You are a concise, helpful assistant. Answer briefly and clearly. Web access for information retrieval is authorized where necessary."
 )
 
 def _load_config() -> Tuple[str, str, str, int]:
@@ -87,21 +87,85 @@ def explain_selection(text: str) -> str:
         log.exception("LLM request failed")
         return f"LLM error: {str(e)}"
 
-def chat(user_text: str, system_prompt: str = DEFAULT_CHAT_SYSTEM_PROMPT) -> str:
+def chat(user_text: str,
+         system_prompt: str = DEFAULT_CHAT_SYSTEM_PROMPT,
+         prev_response_id: Optional[str] = None) -> tuple[str, Optional[str]]:
     """One-off chat turn: system + user → single assistant reply."""
     key = settings.get_api_key()
     if not key:
         log.info("No API key configured; returning helper message")
-        return "No API key set. Open Options and paste your LLM API key."
+        return "No API key set. Open Options and paste your LLM API key.", None
+    
     api_base, _model, chat_model, timeout = _load_config()
+    
     try:
-        return _request_with_fallbacks(
+        # Prefer GPT-5 Responses API with hosted web search (no custom tooling needed)
+        if "gpt-5" in (chat_model or ""):
+            return _chat_with_gpt5_websearch(
+                api_base, key, chat_model, system_prompt, user_text, timeout,
+                token_budget=CHAT_MAX_TOKENS,
+                previous_response_id=prev_response_id
+            )
+        # Otherwise, keep legacy tool-less path (no session id available here)
+        text = _request_with_fallbacks(
             api_base, key, chat_model, system_prompt, user_text, timeout,
             token_budget=CHAT_MAX_TOKENS
         )
+        return text, None
     except Exception as e:
         log.exception("LLM chat request failed")
-        return f"LLM error: {str(e)}"
+        return f"LLM error: {str(e)}", None
+    
+    
+def _chat_with_gpt5_websearch(api_base: str, key: str, model: str, system_prompt: str,
+                              user_text: str, timeout_s: int, token_budget: int,
+                              previous_response_id: Optional[str] = None) -> tuple[str, Optional[str]]:
+
+    """
+    Use GPT-5 Responses API with the hosted 'web_search' tool.
+    No external search code required; OpenAI executes the tool server-side.
+    """
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    url = _join(api_base, "/responses")
+    payload = {
+        "model": model,
+        "temperature": DEFAULT_TEMPERATURE,
+        "max_output_tokens": token_budget,
+        # Optional GPT-5 controls (uncomment to tune):
+        # "reasoning": {"effort": "minimal"},
+        # "text": {"verbosity": "low"},
+        # Use 'instructions' for system-level guidance and a simple input string
+        "instructions": system_prompt,
+        "input": user_text,
+        # Enable hosted web search; allow the model to call it automatically
+        "tools": [{"type": "web_search"}],
+        "tool_choice": "auto",
+    }
+    
+    if previous_response_id:
+        payload["previous_response_id"] = previous_response_id
+    
+    log.debug("POST %s (gpt5 responses + web_search, budget=%d)", url, token_budget)
+    try:
+        data = _post_json(url, headers, payload, timeout_s)
+        _log_token_usage(data, context="responses(gpt5+web_search)", token_budget=token_budget)
+
+        # Prefer Responses API extract; fall back to chat-style if provider proxies formats
+        text = _extract_text_responses(data) or _extract_text_chat_completions(data)
+        rid = data.get("id")
+        return (text if (text and text.strip()) else "(empty response)"), rid
+
+    except (_RetryableEndpointError, _RetryableParamError):
+        # Provider doesn’t support /responses or the param; fall back
+        log.debug("Falling back to chat/completions after /responses error")
+        text = _request_with_fallbacks(
+            api_base, key, model, system_prompt, user_text, timeout_s,
+            token_budget=token_budget
+        )
+        return text, previous_response_id
+    except Exception as e:
+        raise
+
 
 # -------------------- fallback strategy --------------------
 class _RetryableParamError(RuntimeError): ...
@@ -169,7 +233,6 @@ def _chat_completions(api_base: str, headers: Dict[str, str], model: str,
     data = _post_json(url, headers, payload, timeout_s)
 
     _log_token_usage(data, context=f"chat_completions({token_param})", token_budget=token_budget)
-
 
     _raise_if_param_unsupported(data, token_param)
     _raise_if_endpoint_unsupported(data)
@@ -247,10 +310,6 @@ def _log_token_usage(data: Dict[str, Any], context: str, token_budget: Optional[
     except Exception:
         # Never fail the request because of logging
         pass
-
-
-
-
 
 def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout_s: int) -> Dict[str, Any]:
     r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout_s)
