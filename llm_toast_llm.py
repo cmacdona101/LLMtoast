@@ -18,6 +18,7 @@ Auto-adapts across OpenAI-style providers:
 from __future__ import annotations
 
 import os
+import time
 import json
 import logging
 from typing import Optional, Tuple, Any, Dict
@@ -25,6 +26,10 @@ from typing import Optional, Tuple, Any, Dict
 import requests  # pip install requests
 
 import llm_toast_settings as settings
+try:
+    import llm_toast_session_log as slog
+except Exception:
+    slog = None
 
 log = logging.getLogger("clip_llm_tray")
 
@@ -50,7 +55,8 @@ SYSTEM_PROMPT = (
 )
 
 DEFAULT_CHAT_SYSTEM_PROMPT = (
-    "You are a concise, helpful assistant. Answer briefly and clearly. Web access for information retrieval is authorized where necessary."
+    """You are a concise, helpful assistant. Answer briefly and clearly. Web access for information retrieval is authorized where necessary.
+DO NOT PROVIDE ANY URLS OR LINKS IN YOUR RESPONSE."""
 )
 
 def _load_config() -> Tuple[str, str, str, int]:
@@ -89,7 +95,8 @@ def explain_selection(text: str) -> str:
 
 def chat(user_text: str,
          system_prompt: str = DEFAULT_CHAT_SYSTEM_PROMPT,
-         prev_response_id: Optional[str] = None) -> tuple[str, Optional[str]]:
+         prev_response_id: Optional[str] = None,
+         session: Optional["slog.SessionLogger"] = None) -> tuple[str, Optional[str]]:
     """One-off chat turn: system + user → single assistant reply."""
     key = settings.get_api_key()
     if not key:
@@ -104,23 +111,27 @@ def chat(user_text: str,
             return _chat_with_gpt5_websearch(
                 api_base, key, chat_model, system_prompt, user_text, timeout,
                 token_budget=CHAT_MAX_TOKENS,
-                previous_response_id=prev_response_id
+                previous_response_id=prev_response_id,
+                session=session
             )
         # Otherwise, keep legacy tool-less path (no session id available here)
         text = _request_with_fallbacks(
             api_base, key, chat_model, system_prompt, user_text, timeout,
-            token_budget=CHAT_MAX_TOKENS
+            token_budget=CHAT_MAX_TOKENS,
+            session=session
         )
         return text, None
     except Exception as e:
         log.exception("LLM chat request failed")
+        if session:
+            session.log_error(e, context="chat()")
         return f"LLM error: {str(e)}", None
-    
+   
     
 def _chat_with_gpt5_websearch(api_base: str, key: str, model: str, system_prompt: str,
                               user_text: str, timeout_s: int, token_budget: int,
-                              previous_response_id: Optional[str] = None) -> tuple[str, Optional[str]]:
-
+                              previous_response_id: Optional[str] = None,
+                              session: Optional["slog.SessionLogger"] = None) -> tuple[str, Optional[str]]:
     """
     Use GPT-5 Responses API with the hosted 'web_search' tool.
     No external search code required; OpenAI executes the tool server-side.
@@ -146,6 +157,13 @@ def _chat_with_gpt5_websearch(api_base: str, key: str, model: str, system_prompt
         payload["previous_response_id"] = previous_response_id
     
     log.debug("POST %s (gpt5 responses + web_search, budget=%d)", url, token_budget)
+    t0 = time.perf_counter()
+    if session:
+        session.log_request("/responses", {
+            "model": model,
+            "max_output_tokens": token_budget,
+            "has_web_search": True,
+        }, tool_choice="auto", prev_id=previous_response_id)
     try:
         data = _post_json(url, headers, payload, timeout_s)
         _log_token_usage(data, context="responses(gpt5+web_search)", token_budget=token_budget)
@@ -153,14 +171,30 @@ def _chat_with_gpt5_websearch(api_base: str, key: str, model: str, system_prompt
         # Prefer Responses API extract; fall back to chat-style if provider proxies formats
         text = _extract_text_responses(data) or _extract_text_chat_completions(data)
         rid = data.get("id")
-        return (text if (text and text.strip()) else "(empty response)"), rid
+        out = (text if (text and text.strip()) else "(empty response)")
+        if session:
+            usage = data.get("usage") or {}
+            finish = None
+            try:
+                finish = (data.get("choices") or [{}])[0].get("finish_reason")
+            except Exception:
+                pass
+            session.log_response(
+                out, usage=usage, finish_reason=finish,
+                latency_ms=(time.perf_counter() - t0) * 1000.0,
+                response_id=rid
+           )
+        return out, rid
 
     except (_RetryableEndpointError, _RetryableParamError):
         # Provider doesn’t support /responses or the param; fall back
         log.debug("Falling back to chat/completions after /responses error")
+        if session:
+            session.log_error("responses() failed; falling back to chat/completions")
         text = _request_with_fallbacks(
             api_base, key, model, system_prompt, user_text, timeout_s,
-            token_budget=token_budget
+            token_budget=token_budget,
+            session=session
         )
         return text, previous_response_id
     except Exception as e:
@@ -173,7 +207,7 @@ class _RetryableEndpointError(RuntimeError): ...
 
 def _request_with_fallbacks(api_base: str, key: str, model: str,
                             system_prompt: str, user_text: str, timeout_s: int,
-                            token_budget: int) -> str:
+                            token_budget: int, session: Optional["slog.SessionLogger"] = None) -> str:
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
@@ -184,7 +218,7 @@ def _request_with_fallbacks(api_base: str, key: str, model: str,
     try:
         return _chat_completions(api_base, headers, model, system_prompt, user_text,
                                  timeout_s, token_param="max_completion_tokens",
-                                 token_budget=token_budget)
+                                 token_budget=token_budget, session=session)
     except _RetryableParamError:
         pass
     except _RetryableEndpointError:
@@ -194,7 +228,7 @@ def _request_with_fallbacks(api_base: str, key: str, model: str,
     try:
         return _chat_completions(api_base, headers, model, system_prompt, user_text,
                                  timeout_s, token_param="max_output_tokens",
-                                 token_budget=token_budget)
+                                 token_budget=token_budget, session=session)
     except _RetryableParamError:
         pass
     except _RetryableEndpointError:
@@ -204,7 +238,7 @@ def _request_with_fallbacks(api_base: str, key: str, model: str,
     try:
         return _chat_completions(api_base, headers, model, system_prompt, user_text,
                                  timeout_s, token_param="max_tokens",
-                                 token_budget=token_budget)
+                                 token_budget=token_budget, session=session)
     except _RetryableParamError:
         pass
     except _RetryableEndpointError:
@@ -213,12 +247,13 @@ def _request_with_fallbacks(api_base: str, key: str, model: str,
     # 4) /responses with max_output_tokens
     return _responses(api_base, headers, model, system_prompt, user_text,
                       timeout_s, token_param="max_output_tokens",
-                      token_budget=token_budget)
+                      token_budget=token_budget, session=session)
 
 # -------------------- HTTP variants --------------------
 def _chat_completions(api_base: str, headers: Dict[str, str], model: str,
                       system_prompt: str, user_text: str, timeout_s: int,
-                      token_param: str, token_budget: int) -> str:
+                      token_param: str, token_budget: int,
+                      session: Optional["slog.SessionLogger"] = None) -> str:
     url = _join(api_base, "/chat/completions")
     payload = {
         "model": model,
@@ -230,6 +265,9 @@ def _chat_completions(api_base: str, headers: Dict[str, str], model: str,
         ]
     }
     log.debug("POST %s (model=%s, %s=%d, text_len=%d)", url, model, token_param, token_budget, len(user_text))
+    t0 = time.perf_counter()
+    if session:
+        session.log_request("/chat/completions", {"model": model, token_param: token_budget})
     data = _post_json(url, headers, payload, timeout_s)
 
     _log_token_usage(data, context=f"chat_completions({token_param})", token_budget=token_budget)
@@ -237,11 +275,21 @@ def _chat_completions(api_base: str, headers: Dict[str, str], model: str,
     _raise_if_param_unsupported(data, token_param)
     _raise_if_endpoint_unsupported(data)
 
-    return _extract_text_chat_completions(data)
+    text = _extract_text_chat_completions(data)
+    if session:
+        usage = data.get("usage") or {}
+        finish = None
+        try:
+            finish = (data.get("choices") or [{}])[0].get("finish_reason")
+        except Exception:
+            pass
+        session.log_response(text, usage=usage, finish_reason=finish, latency_ms=(time.perf_counter() - t0) * 1000.0)
+    return text
 
 def _responses(api_base: str, headers: Dict[str, str], model: str,
                system_prompt: str, user_text: str, timeout_s: int,
-               token_param: str, token_budget: int) -> str:
+               token_param: str, token_budget: int,
+               session: Optional["slog.SessionLogger"] = None) -> str:
     """
     Try /responses with two content type flavors:
       - 'text' (classic)
@@ -266,6 +314,9 @@ def _responses(api_base: str, headers: Dict[str, str], model: str,
         log.debug("POST %s (model=%s, %s=%d, text_len=%d, ctype=%s)",
                   url, model, token_param, token_budget, len(user_text), ctype)
         try:
+            t0 = time.perf_counter()
+            if session:
+                session.log_request("/responses", {"model": model, token_param: token_budget, "ctype": ctype})
             data = _post_json(url, headers, payload, timeout_s)
             _log_token_usage(data, context=f"chat_completions({token_param})", token_budget=token_budget)
 
@@ -279,11 +330,24 @@ def _responses(api_base: str, headers: Dict[str, str], model: str,
 
         # Extract either OpenAI-style or typed Responses shapes
         try:
-            return _extract_text_chat_completions(data)
+            text = _extract_text_chat_completions(data)
+            if session:
+                usage = data.get("usage") or {}
+                finish = None
+                try:
+                    finish = (data.get("choices") or [{}])[0].get("finish_reason")
+                except Exception:
+                    pass
+                session.log_response(text, usage=usage, finish_reason=finish, latency_ms=(time.perf_counter() - t0) * 1000.0)
+            return text
         except Exception:
             text = _extract_text_responses(data)
             if text is not None and text.strip():
-                return text.strip()
+                out = text.strip()
+                if session:
+                    usage = data.get("usage") or {}
+                    session.log_response(out, usage=usage, latency_ms=(time.perf_counter() - t0) * 1000.0)
+                return out
             last_err = RuntimeError("Unexpected /responses format")
 
     # Both variants failed
