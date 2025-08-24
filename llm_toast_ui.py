@@ -17,6 +17,12 @@ from tkinter import font as tkfont
 import llm_toast_core as core
 import llm_toast_llm as llm
 
+# Optional session logger (per-chat-window markdown logs)
+try:
+    import llm_toast_session_log as slog
+except Exception:
+    slog = None
+
 import llm_toast_settings as settings
 
 log = core.log  # shared logger
@@ -174,6 +180,8 @@ class ChatWindow:
         self.sending = False
         # Session id for GPT-5 Responses API; persists until window is closed
         self.prev_response_id = None
+        # Per-window session logger (markdown transcript)
+        self.session = None
 
     def is_visible(self):
         return bool(self.win and self.win.winfo_exists() and self.win.state() != "withdrawn")
@@ -194,7 +202,7 @@ class ChatWindow:
         
         w = tk.Toplevel(self.root)
         self.win = w
-        w.title("ClipLLM Chat")
+        w.title("AI Hotkey")
         w.resizable(True, False)
         w.attributes("-topmost", True)
 
@@ -313,12 +321,35 @@ class ChatWindow:
         self.root.after(100, _ensure_focus)
         self.root.after(200, _ensure_focus)
         
-        
-        
+        # Create per-session markdown log file (once per window)
+        if self.session is None and slog is not None:
+            try:
+                self.session = slog.SessionLogger(kind="chat")
+                log.info("Session log file: %s", getattr(self.session, "path", "(unknown)"))
+            except Exception:
+                self.session = None
         
         # Clear session only when the window is actually closed via the titlebar
+
         def _on_close():
             self.prev_response_id = None
+            try:
+                if self.session:
+                    try:
+                        self.session.end_session()  # add trailing newline after session
+                        self.session.close()        # flush/close file
+                    except Exception:
+                        pass
+            finally:
+                self.session = None  # new header next time you open chat
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+            self.session = None  # new session header next time you open chat
+          
+          
             try:
                 w.destroy()
             except Exception:
@@ -330,9 +361,6 @@ class ChatWindow:
             self.win.withdraw()
         # Do NOT clear prev_response_id here; keep session across hides
 
-    
-    
-    
     def _append(self, who: str, text: str):
         if not self.out: return
         self.out.config(state="normal")
@@ -355,6 +383,17 @@ class ChatWindow:
         if not msg: return "break"
         self.inp.delete(0, "end")
         self._append("You", msg)
+        
+        
+        
+        # Log the user's query to the single append-only chat log
+        if self.session:
+            try:
+                self.session.log_user(msg)
+            except Exception:
+                pass
+        
+        
         self.sending = True
         self.inp.config(state="disabled")
         threading.Thread(target=self._send_worker, args=(msg,), daemon=True).start()
@@ -362,9 +401,28 @@ class ChatWindow:
 
     def _send_worker(self, msg: str):
         try:
-            reply, rid = llm.chat(msg, prev_response_id=self.prev_response_id)
+            
+            
+            # Don't pass session into llm.chat—UI owns logging to avoid duplication
+            reply, rid = llm.chat(
+                msg,
+                prev_response_id=self.prev_response_id
+            )
+            
+            
             if rid:
                 self.prev_response_id = rid
+       
+        
+            # Log the assistant reply to file
+            if self.session:
+                try:
+                    self.session.log_assistant(reply)
+                except Exception:
+                    pass
+        
+        
+        
         except Exception as e:
             reply = f"Error: {e}"
             
